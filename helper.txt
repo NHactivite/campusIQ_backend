@@ -1,0 +1,1306 @@
+import { Request, Response } from "express";
+import { isValidObjectId, Types } from "mongoose";
+import Event, { IMedia, EVENT_CATEGORIES } from "../models/Event";
+import { uploadEventFiles, deleteMedia } from "../utils/cloudinary";
+import { asyncHandler, ApiError, slugify, toArray } from "../utils/helpers";
+import { cached, cacheGet, cacheSet, invalidate, publicCache, noStore } from "../utils/cache";
+
+type Files = { [field: string]: Express.Multer.File[] } | undefined;
+const folderFor = (slug: string) => `iic/events/${slug}`;
+const allMedia = (e: { images: IMedia[]; videos: IMedia[]; documents: IMedia[] }) =>
+  [...e.images, ...e.videos, ...e.documents];
+
+const pickFields = (b: Request["body"]) => {
+  const out: Record<string, any> = {};
+  for (const k of ["title", "description", "category", "venue", "organiser", "outcome"]) if (b[k] !== undefined) out[k] = b[k];
+  if (b.eventDate) out.eventDate = new Date(b.eventDate);
+  if (b.endDate) out.endDate = new Date(b.endDate);
+  if (b.participants !== undefined && b.participants !== "") out.participants = Number(b.participants);
+  if (b.isPublished !== undefined) out.isPublished = b.isPublished === true || b.isPublished === "true";
+  return out;
+};
+
+// POST /api/events  (admin, multipart/form-data)
+export const createEvent = asyncHandler(async (req, res) => {
+  const fields = pickFields(req.body);
+  if (!fields.title) throw new ApiError(400, "Title is required");
+
+  const event = new Event({ ...fields, slug: slugify(fields.title), createdBy: req.user?.id });
+  const uploaded = await uploadEventFiles(req.files as Files, folderFor(event.title));
+  event.images = uploaded.images;
+  event.videos = uploaded.videos;
+  event.documents = uploaded.documents;
+
+  try {
+    await event.save();
+  } catch (err) {
+    await deleteMedia(allMedia(uploaded)); // don't leave orphan files in Cloudinary
+    throw err;
+  }
+  await invalidate("events");
+  res.status(201).json({ success: true, data: event });
+});
+
+// GET /api/events  (public: published only)
+// ?category=IIC&search=hackathon&status=upcoming|past&page=1&limit=12
+export const getEvents = asyncHandler(async (req, res) => buildList(req, res, true));
+
+// GET /api/events/admin/all  (admin: includes drafts)
+// extra admin filter: ?published=true|false
+export const getAdminEvents = asyncHandler(async (req, res) => buildList(req, res, false));
+
+async function buildList(req: Request, res: Response, publicOnly: boolean) {
+  const { category, search, status, published } = req.query as Record<string, string | undefined>;
+  const page = Math.max(1, Number(req.query.page) || 1);
+  const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 12));
+
+  // only accept known values, so junk query strings can't create endless cache keys
+  const validCategory = category && (EVENT_CATEGORIES as readonly string[]).includes(category) ? category : undefined;
+  const validStatus = status === "upcoming" || status === "past" ? status : undefined;
+
+  const filter: Record<string, any> = {};
+  if (publicOnly) filter.isPublished = true;
+  else if (published === "true") filter.isPublished = true;    // admin only
+  else if (published === "false") filter.isPublished = false;  // admin only
+  if (validCategory) filter.category = validCategory;
+  if (search) filter.title = { $regex: search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), $options: "i" };
+  if (validStatus === "upcoming") filter.eventDate = { $gte: new Date() };
+  if (validStatus === "past") filter.eventDate = { $lt: new Date() };
+
+  const load = async () => {
+    const [items, total] = await Promise.all([
+      Event.find(filter).sort({ eventDate: -1 }).skip((page - 1) * limit).limit(limit),
+      Event.countDocuments(filter),
+    ]);
+    return { success: true, data: items, pagination: { page, limit, total, pages: Math.ceil(total / limit) } };
+  };
+
+  // Only the public list is cached. Searches are skipped (every query is different),
+  // and the admin list is never cached so admins always see their latest edits.
+  if (publicOnly && !search) {
+    publicCache(res, 30);
+    const key = `list:${validCategory ?? ""}:${validStatus ?? ""}:${page}:${limit}`;
+    return res.json(await cached("events", key, 120, load));
+  }
+  noStore(res);
+  res.json(await load());
+}
+
+// GET /api/events/admin/stats  (admin) – exact counts, however many events exist
+export const getEventStats = asyncHandler(async (_req, res) => {
+  const now = new Date();
+  const [total, upcoming, drafts, byCategory, recent] = await Promise.all([
+    Event.countDocuments(),
+    Event.countDocuments({ eventDate: { $gte: now } }),
+    Event.countDocuments({ isPublished: false }),
+    Event.aggregate([{ $group: { _id: "$category", count: { $sum: 1 } } }]),
+    Event.find().sort({ eventDate: -1 }).limit(5),
+  ]);
+
+  noStore(res);
+  res.json({
+    success: true,
+    data: {
+      total,
+      upcoming,
+      past: total - upcoming,
+      drafts,
+      byCategory: Object.fromEntries(byCategory.map((c) => [c._id, c.count])),
+      recent,
+    },
+  });
+});
+
+// GET /api/events/:idOrSlug  (public)
+export const getEvent = asyncHandler(async (req, res) => {
+  const key = req.params.idOrSlug as string;
+  const ckey = `one:${key.slice(0, 200)}`;
+
+  const hit = await cacheGet<{ success: boolean; data: unknown }>("events", ckey);
+  if (hit) {
+    publicCache(res, 30);
+    return res.json(hit);
+  }
+
+  const event = await Event.findOne(isValidObjectId(key) ? { _id: key } : { slug: key });
+  if (!event || (!event.isPublished && req.user?.role !== "admin")) throw new ApiError(404, "Event not found");
+
+  const body = { success: true, data: event };
+  if (event.isPublished) {
+    // only published events are stored, so a draft (visible to admins) never leaks to the public
+    await cacheSet("events", ckey, body, 300);
+    publicCache(res, 30);
+  } else {
+    noStore(res);
+  }
+  res.json(body);
+});
+
+// PATCH /api/events/:id  (admin, multipart) – edit fields, add files, remove files via `removeMedia`
+export const updateEvent = asyncHandler(async (req, res) => {
+  const event = await Event.findById(req.params.id);
+  if (!event) throw new ApiError(404, "Event not found");
+
+  Object.assign(event, pickFields(req.body));
+
+  // remove selected media (ids of the media subdocuments)
+  const removeIds = new Set(toArray(req.body.removeMedia));
+  const removed: IMedia[] = [];
+  for (const key of ["images", "videos", "documents"] as const) {
+    const keep: IMedia[] = [];
+    for (const m of event[key]) (removeIds.has(String(m._id)) ? removed : keep).push(m);
+    event[key] = keep as any;
+  }
+
+  // add newly uploaded media
+  const uploaded = await uploadEventFiles(req.files as Files, folderFor(event.slug));
+  event.images.push(...(uploaded.images as any));
+  event.videos.push(...(uploaded.videos as any));
+  event.documents.push(...(uploaded.documents as any));
+
+  try {
+    await event.save();
+  } catch (err) {
+    await deleteMedia(allMedia(uploaded));
+    throw err;
+  }
+  await deleteMedia(removed); // only after the DB save succeeded
+  await invalidate("events");
+  res.json({ success: true, data: event });
+});
+
+// DELETE /api/events/:id  (admin)
+export const deleteEvent = asyncHandler(async (req, res) => {
+  const event = await Event.findByIdAndDelete(req.params.id);
+  if (!event) throw new ApiError(404, "Event not found");
+  await deleteMedia(allMedia(event));
+  await invalidate("events");
+  res.json({ success: true, message: "Event deleted" });
+});
+
+// DELETE /api/events/:id/media/:mediaId  (admin)
+export const deleteEventMedia = asyncHandler(async (req, res) => {
+  const event = await Event.findById(req.params.id);
+  if (!event) throw new ApiError(404, "Event not found");
+
+  const mediaId = req.params.mediaId as string;
+  let removed: IMedia | undefined;
+  for (const key of ["images", "videos", "documents"] as const) {
+    const found = event[key].find((m) => String(m._id) === mediaId);
+    if (found) { removed = found; event[key] = event[key].filter((m) => String(m._id) !== mediaId) as any; break; }
+  }
+  if (!removed) throw new ApiError(404, "Media not found");
+
+  await event.save();
+  await deleteMedia([removed]);
+  await invalidate("events");
+  res.json({ success: true, data: event });
+});
+
+import { Request } from "express";
+import { isValidObjectId } from "mongoose";
+import Feature, { FEATURE_SECTIONS, FeatureSection } from "../models/Feature";
+import { asyncHandler, ApiError, toArray } from "../utils/helpers";
+import { cached, invalidate, publicCache, noStore } from "../utils/cache";
+
+const pickFields = (b: Request["body"]) => {
+  const out: Record<string, any> = {};
+  for (const k of ["title", "text", "icon", "section"]) if (b[k] !== undefined) out[k] = b[k];
+  if (b.tags !== undefined) out.tags = toArray(b.tags).map((t) => t.trim()).filter(Boolean);
+  if (b.order !== undefined && b.order !== "") out.order = Number(b.order);
+  if (b.isPublished !== undefined) out.isPublished = b.isPublished === true || b.isPublished === "true";
+  return out;
+};
+
+// validates AND narrows the type from string to "rdc" | "iic"
+const parseSection = (value: unknown, fallback?: FeatureSection): FeatureSection | undefined => {
+  if (value === undefined || value === "") return fallback;
+  if (!(FEATURE_SECTIONS as readonly string[]).includes(value as string))
+    throw new ApiError(400, `section must be one of: ${FEATURE_SECTIONS.join(", ")}`);
+  return value as FeatureSection;
+};
+
+// GET /api/features?section=rdc   (public: published only)
+export const getFeatures = asyncHandler(async (req, res) => {
+  const section = parseSection(req.query.section, "rdc")!; // validated, so only 2 possible cache keys
+  publicCache(res, 30);
+  const body = await cached("features", `section:${section}`, 600, async () => ({
+    success: true,
+    data: await Feature.find({ section, isPublished: true }).sort({ order: 1, createdAt: 1 }),
+  }));
+  res.json(body);
+});
+
+// GET /api/features/admin/all?section=rdc   (admin: includes unpublished)
+export const getAdminFeatures = asyncHandler(async (req, res) => {
+  const section = parseSection(req.query.section);
+  const items = await Feature.find(section ? { section } : {}).sort({ section: 1, order: 1 });
+  noStore(res);
+  res.json({ success: true, data: items });
+});
+
+// GET /api/features/:id
+export const getFeature = asyncHandler(async (req, res) => {
+  if (!isValidObjectId(req.params.id)) throw new ApiError(400, "Invalid id");
+  const item = await Feature.findById(req.params.id);
+  if (!item) throw new ApiError(404, "Feature not found");
+  res.json({ success: true, data: item });
+});
+
+// POST /api/features   (admin, JSON)
+export const createFeature = asyncHandler(async (req, res) => {
+  const fields = pickFields(req.body);
+  const section = parseSection(fields.section, "rdc")!;
+  if (!fields.title) throw new ApiError(400, "Title is required");
+  if (!fields.text) throw new ApiError(400, "Text is required");
+
+  // put new card at the end of its section unless an order is given
+  if (fields.order === undefined) {
+    fields.order = await Feature.countDocuments({ section });
+  }
+  const item = await Feature.create({ ...fields, section, createdBy: req.user?.id });
+  await invalidate("features");
+  res.status(201).json({ success: true, data: item });
+});
+
+// PATCH /api/features/:id   (admin, JSON)
+export const updateFeature = asyncHandler(async (req, res) => {
+  if (!isValidObjectId(req.params.id)) throw new ApiError(400, "Invalid id");
+  const fields = pickFields(req.body);
+  if (fields.section !== undefined) fields.section = parseSection(fields.section);
+
+  const item = await Feature.findByIdAndUpdate(req.params.id, fields, { new: true, runValidators: true });
+  if (!item) throw new ApiError(404, "Feature not found");
+  await invalidate("features");
+  res.json({ success: true, data: item });
+});
+
+// PATCH /api/features/reorder   (admin)  body: { items: [{ id, order }, ...] }
+export const reorderFeatures = asyncHandler(async (req, res) => {
+  const items = req.body.items as { id: string; order: number }[];
+  if (!Array.isArray(items) || items.length === 0) throw new ApiError(400, "items array is required");
+  if (items.some((i) => !isValidObjectId(i.id) || typeof i.order !== "number"))
+    throw new ApiError(400, "Each item needs a valid id and numeric order");
+
+  await Feature.bulkWrite(
+    items.map((i) => ({ updateOne: { filter: { _id: i.id }, update: { $set: { order: i.order } } } }))
+  );
+  await invalidate("features");
+  res.json({ success: true, message: "Order updated" });
+});
+
+// DELETE /api/features/:id   (admin)
+export const deleteFeature = asyncHandler(async (req, res) => {
+  if (!isValidObjectId(req.params.id)) throw new ApiError(400, "Invalid id");
+  const item = await Feature.findByIdAndDelete(req.params.id);
+  if (!item) throw new ApiError(404, "Feature not found");
+  await invalidate("features");
+  res.json({ success: true, message: "Feature deleted" });
+});
+
+
+import { Request } from "express";
+import { isValidObjectId } from "mongoose";
+import Glance from "../models/Glance";
+import { asyncHandler, ApiError } from "../utils/helpers";
+import { cached, invalidate, publicCache, noStore } from "../utils/cache";
+
+const pickFields = (b: Request["body"]) => {
+  const out: Record<string, any> = {};
+  for (const k of ["value", "label", "text", "category", "footnote"])
+    if (b[k] !== undefined) out[k] = String(b[k]).trim();
+  if (b.order !== undefined && b.order !== "") out.order = Number(b.order);
+  if (b.isPublished !== undefined) out.isPublished = b.isPublished === true || b.isPublished === "true";
+  if (b.highlight !== undefined) out.highlight = b.highlight === true || b.highlight === "true";
+  return out;
+};
+
+// GET /api/glance   (public: published only)
+export const getGlance = asyncHandler(async (_req, res) => {
+  publicCache(res, 30);
+  const body = await cached("glance", "all", 600, async () => ({
+    success: true,
+    data: await Glance.find({ isPublished: true }).sort({ order: 1, createdAt: 1 }),
+  }));
+  res.json(body);
+});
+
+// GET /api/glance/admin/all   (admin: includes hidden)
+export const getAdminGlance = asyncHandler(async (_req, res) => {
+  const items = await Glance.find().sort({ order: 1, createdAt: 1 });
+  noStore(res);
+  res.json({ success: true, data: items });
+});
+
+// POST /api/glance   (admin, JSON)
+export const createGlance = asyncHandler(async (req, res) => {
+  const fields = pickFields(req.body);
+  if (!fields.value) throw new ApiError(400, "Value is required");
+  if (!fields.label) throw new ApiError(400, "Label is required");
+  if (!fields.text) throw new ApiError(400, "Text is required");
+
+  if (fields.order === undefined) fields.order = await Glance.countDocuments();
+  const item = await Glance.create({ ...fields, createdBy: req.user?.id });
+  await invalidate("glance");
+  res.status(201).json({ success: true, data: item });
+});
+
+// PATCH /api/glance/:id   (admin, JSON)
+export const updateGlance = asyncHandler(async (req, res) => {
+  if (!isValidObjectId(req.params.id)) throw new ApiError(400, "Invalid id");
+  const item = await Glance.findByIdAndUpdate(req.params.id, pickFields(req.body), { new: true, runValidators: true });
+  if (!item) throw new ApiError(404, "Card not found");
+  await invalidate("glance");
+  res.json({ success: true, data: item });
+});
+
+// PATCH /api/glance/reorder   (admin)  body: { items: [{ id, order }] }
+export const reorderGlance = asyncHandler(async (req, res) => {
+  const items = req.body.items as { id: string; order: number }[];
+  if (!Array.isArray(items) || items.length === 0) throw new ApiError(400, "items array is required");
+  if (items.some((i) => !isValidObjectId(i.id) || typeof i.order !== "number"))
+    throw new ApiError(400, "Each item needs a valid id and numeric order");
+
+  await Glance.bulkWrite(
+    items.map((i) => ({ updateOne: { filter: { _id: i.id }, update: { $set: { order: i.order } } } }))
+  );
+  await invalidate("glance");
+  res.json({ success: true, message: "Order updated" });
+});
+
+// DELETE /api/glance/:id   (admin)
+export const deleteGlance = asyncHandler(async (req, res) => {
+  if (!isValidObjectId(req.params.id)) throw new ApiError(400, "Invalid id");
+  const item = await Glance.findByIdAndDelete(req.params.id);
+  if (!item) throw new ApiError(404, "Card not found");
+  await invalidate("glance");
+  res.json({ success: true, message: "Card deleted" });
+});
+
+
+import { Request } from "express";
+import { isValidObjectId } from "mongoose";
+import Linkage, { LINKAGE_STATUSES, LinkageStatus } from "../models/Linkage";
+import { asyncHandler, ApiError } from "../utils/helpers";
+import { cached, invalidate, publicCache, noStore } from "../utils/cache";
+
+const pickFields = (b: Request["body"]) => {
+  const out: Record<string, any> = {};
+  for (const k of ["title", "status", "text"]) if (b[k] !== undefined) out[k] = String(b[k]).trim();
+  if (b.order !== undefined && b.order !== "") out.order = Number(b.order);
+  if (b.isPublished !== undefined) out.isPublished = b.isPublished === true || b.isPublished === "true";
+  return out;
+};
+
+// validates AND narrows string -> LinkageStatus
+const parseStatus = (value: unknown): LinkageStatus | undefined => {
+  if (value === undefined || value === "") return undefined;
+  if (!(LINKAGE_STATUSES as readonly string[]).includes(value as string))
+    throw new ApiError(400, `status must be one of: ${LINKAGE_STATUSES.join(", ")}`);
+  return value as LinkageStatus;
+};
+
+// GET /api/linkages?status=Initiated   (public: published only, status optional)
+export const getLinkages = asyncHandler(async (req, res) => {
+  const status = parseStatus(req.query.status); // validated, so the cache key space is tiny
+  publicCache(res, 30);
+  const body = await cached("linkages", `status:${status ?? "all"}`, 600, async () => ({
+    success: true,
+    data: await Linkage.find({ isPublished: true, ...(status && { status }) }).sort({ order: 1, createdAt: 1 }),
+  }));
+  res.json(body);
+});
+
+// GET /api/linkages/admin/all   (admin: includes hidden)
+export const getAdminLinkages = asyncHandler(async (_req, res) => {
+  const items = await Linkage.find().sort({ order: 1, createdAt: 1 });
+  noStore(res);
+  res.json({ success: true, data: items });
+});
+
+// GET /api/linkages/:id
+export const getLinkage = asyncHandler(async (req, res) => {
+  if (!isValidObjectId(req.params.id)) throw new ApiError(400, "Invalid id");
+  const item = await Linkage.findById(req.params.id);
+  if (!item) throw new ApiError(404, "Linkage not found");
+  res.json({ success: true, data: item });
+});
+
+// POST /api/linkages   (admin, JSON)
+export const createLinkage = asyncHandler(async (req, res) => {
+  const fields = pickFields(req.body);
+  const status = parseStatus(fields.status);
+  if (!fields.title) throw new ApiError(400, "Title is required");
+  if (!status) throw new ApiError(400, "Status is required");
+  if (!fields.text) throw new ApiError(400, "Text is required");
+
+  if (fields.order === undefined) fields.order = await Linkage.countDocuments();
+  const item = await Linkage.create({ ...fields, status, createdBy: req.user?.id });
+  await invalidate("linkages");
+  res.status(201).json({ success: true, data: item });
+});
+
+// PATCH /api/linkages/:id   (admin, JSON)
+export const updateLinkage = asyncHandler(async (req, res) => {
+  if (!isValidObjectId(req.params.id)) throw new ApiError(400, "Invalid id");
+  const fields = pickFields(req.body);
+  if (fields.status !== undefined) fields.status = parseStatus(fields.status);
+
+  const item = await Linkage.findByIdAndUpdate(req.params.id, fields, { new: true, runValidators: true });
+  if (!item) throw new ApiError(404, "Linkage not found");
+  await invalidate("linkages");
+  res.json({ success: true, data: item });
+});
+
+// PATCH /api/linkages/reorder   (admin)  body: { items: [{ id, order }] }
+export const reorderLinkages = asyncHandler(async (req, res) => {
+  const items = req.body.items as { id: string; order: number }[];
+  if (!Array.isArray(items) || items.length === 0) throw new ApiError(400, "items array is required");
+  if (items.some((i) => !isValidObjectId(i.id) || typeof i.order !== "number"))
+    throw new ApiError(400, "Each item needs a valid id and numeric order");
+
+  await Linkage.bulkWrite(
+    items.map((i) => ({ updateOne: { filter: { _id: i.id }, update: { $set: { order: i.order } } } }))
+  );
+  await invalidate("linkages");
+  res.json({ success: true, message: "Order updated" });
+});
+
+// DELETE /api/linkages/:id   (admin)
+export const deleteLinkage = asyncHandler(async (req, res) => {
+  if (!isValidObjectId(req.params.id)) throw new ApiError(400, "Invalid id");
+  const item = await Linkage.findByIdAndDelete(req.params.id);
+  if (!item) throw new ApiError(404, "Linkage not found");
+  await invalidate("linkages");
+  res.json({ success: true, message: "Linkage deleted" });
+});
+
+
+import { Request, Response, NextFunction } from "express";
+import { getAuth, clerkClient } from "@clerk/express";
+import { ApiError } from "../utils/helpers";
+
+// remembers the role check for 60 s, so each request doesn't call Clerk
+const cache = new Map<string, { admin: boolean; at: number }>();
+const TTL = 60_000;
+
+const isAdminUser = async (userId: string, claims: any): Promise<boolean> => {
+  if (claims?.metadata?.role) return claims.metadata.role === "admin"; // only if you customised the session token
+
+  const hit = cache.get(userId);
+  if (hit && Date.now() - hit.at < TTL) return hit.admin;
+
+  const user = await clerkClient.users.getUser(userId);
+  const admin = (user.publicMetadata as { role?: string })?.role === "admin";
+  cache.set(userId, { admin, at: Date.now() });
+  return admin;
+};
+
+export const requireAdmin = async (req: Request, _res: Response, next: NextFunction) => {
+  try {
+    const { userId, sessionClaims } = getAuth(req);
+    if (!userId) throw new ApiError(401, "Not authenticated");
+    if (!(await isAdminUser(userId, sessionClaims))) throw new ApiError(403, "Admin access required");
+    req.user = { id: userId, role: "admin" };
+    next();
+  } catch (err) {
+    next(err);
+  }
+};
+
+// never blocks: sets req.user only when the caller is a signed-in admin (used on public routes)
+export const optionalAdmin = async (req: Request, _res: Response, next: NextFunction) => {
+  try {
+    const { userId, sessionClaims } = getAuth(req);
+    if (userId && (await isAdminUser(userId, sessionClaims))) req.user = { id: userId, role: "admin" };
+  } catch {
+    /* treat as public */
+  }
+  next();
+};
+
+
+
+import { Request, Response, NextFunction } from "express";
+import multer from "multer";
+import { ApiError } from "../utils/helpers";
+
+export const notFound = (_req: Request, res: Response) =>
+  res.status(404).json({ success: false, message: "Route not found" });
+
+export const errorHandler = (err: any, _req: Request, res: Response, _next: NextFunction) => {
+  let status = 500;
+  let message = err.message || "Server error";
+
+  if (err instanceof ApiError) status = err.status;
+  else if (err instanceof multer.MulterError) status = 400;
+  else if (err.name === "ValidationError") { status = 400; message = Object.values<any>(err.errors).map((e) => e.message).join(", "); }
+  else if (err.name === "CastError") { status = 400; message = "Invalid id"; }
+
+  if (status === 500) console.error(err);
+  res.status(status).json({ success: false, message });
+};
+
+
+import { Request, Response, NextFunction } from "express";
+import { apiLimiter, writeLimiter, Limiter } from "../utils/ratelimit.js";
+
+const make =
+  (limiter: Limiter, keyOf: (req: Request) => string) =>
+  async (req: Request, res: Response, next: NextFunction) => {
+    if (req.method === "OPTIONS") return next();
+
+    try {
+      const { success, limit, remaining, reset } = await limiter.limit(keyOf(req));
+      res.setHeader("X-RateLimit-Limit", String(limit));
+      res.setHeader("X-RateLimit-Remaining", String(remaining));
+      res.setHeader("X-RateLimit-Reset", String(Math.ceil(reset / 1000)));
+
+      if (!success) {
+        res.setHeader("Retry-After", String(Math.max(1, Math.ceil((reset - Date.now()) / 1000))));
+        return res.status(429).json({ success: false, message: "Too many requests. Please try again later." });
+      }
+    } catch (err) {
+      console.error("Rate limit error:", err); // fail open: a Redis hiccup must not lock everyone out
+    }
+    next();
+  };
+
+export const rateLimitMiddleware = make(apiLimiter, (req) => req.ip ?? "unknown");
+export const writeRateLimit = make(writeLimiter, (req) => req.user?.id ?? req.ip ?? "unknown");
+
+
+
+import multer from "multer";
+import { ApiError } from "../utils/helpers";
+
+const allowed: Record<string, RegExp> = {
+  images: /^image\/(jpeg|png|webp|gif)$/,
+  videos: /^video\/(mp4|webm|quicktime)$/,
+  documents:
+    /^application\/(pdf|msword|vnd\.openxmlformats-officedocument\.(wordprocessingml\.document|spreadsheetml\.sheet|presentationml\.presentation)|vnd\.ms-excel|vnd\.ms-powerpoint)$/,
+};
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 100 * 1024 * 1024 }, // 100 MB (Cloudinary free-plan video limit)
+  fileFilter: (_req, file, cb) => {
+    const rule = allowed[file.fieldname];
+    if (!rule) return cb(new ApiError(400, `Unexpected field: ${file.fieldname}`));
+    if (!rule.test(file.mimetype)) return cb(new ApiError(400, `Invalid file type for ${file.fieldname}: ${file.mimetype}`));
+    cb(null, true);
+  },
+});
+
+export const eventUpload = upload.fields([
+  { name: "images", maxCount: 10 },
+  { name: "videos", maxCount: 3 },
+  { name: "documents", maxCount: 10 },
+]);
+
+
+import { Schema, model, Types, HydratedDocument } from "mongoose";
+
+export type ResourceType = "image" | "video" | "raw";
+
+export interface IMedia {
+  _id?: Types.ObjectId;
+  url: string;
+  publicId: string;
+  resourceType: ResourceType;
+  format?: string;
+  bytes?: number;
+  originalName?: string;
+  width?: number;
+  height?: number;
+  duration?: number;
+}
+
+export const EVENT_CATEGORIES = ["RDC", "IIC", "Learning", "Incubation", "Linkages", "IPR", "Other"] as const;
+
+export interface IEvent {
+  title: string;
+  slug: string;
+  description: string;
+  category: (typeof EVENT_CATEGORIES)[number];
+  eventDate: Date;
+  endDate?: Date;
+  venue?: string;
+  organiser?: string;
+  participants?: number;
+  outcome?: string;
+  isPublished: boolean;
+  images: IMedia[];
+  videos: IMedia[];
+  documents: IMedia[];
+  createdBy?: string;
+}
+export type EventDoc = HydratedDocument<IEvent>;
+
+const mediaSchema = new Schema<IMedia>(
+  {
+    url: { type: String, required: true },
+    publicId: { type: String, required: true },
+    resourceType: { type: String, enum: ["image", "video", "raw"], required: true },
+    format: String,
+    bytes: Number,
+    originalName: String,
+    width: Number,
+    height: Number,
+    duration: Number,
+  },
+  { _id: true }
+);
+
+const eventSchema = new Schema<IEvent>(
+  {
+    title: { type: String, required: true, trim: true, maxlength: 200 },
+    slug: { type: String, required: true, unique: true, index: true },
+    description: { type: String, required: true },
+    category: { type: String, enum: EVENT_CATEGORIES, default: "Other", index: true },
+    eventDate: { type: Date, required: true, index: true },
+    endDate: Date,
+    venue: String,
+    organiser: String,
+    participants: { type: Number, min: 0 },
+    outcome: String,
+    isPublished: { type: Boolean, default: true },
+    images: { type: [mediaSchema], default: [] },
+    videos: { type: [mediaSchema], default: [] },
+    documents: { type: [mediaSchema], default: [] },
+    createdBy: { type: String, index: true }, 
+  },
+  { timestamps: true, toJSON: { virtuals: true } }
+);
+
+// First image is used as the cover
+eventSchema.virtual("coverImage").get(function () {
+  return this.images?.[0]?.url ?? null;
+});
+
+export default model<IEvent>("Event", eventSchema);
+
+import { Schema, model } from "mongoose";
+
+export const FEATURE_SECTIONS = ["rdc", "iic"] as const;
+export type FeatureSection = (typeof FEATURE_SECTIONS)[number];
+
+export interface IFeature {
+  section: FeatureSection;
+  icon: string;          // lucide-react icon name, e.g. "Landmark"
+  title: string;
+  text: string;
+  tags: string[];
+  order: number;         // display position within the section
+  isPublished: boolean;
+  createdBy?: string;    // Clerk user id
+}
+
+const featureSchema = new Schema<IFeature>(
+  {
+    section: { type: String, enum: FEATURE_SECTIONS, default: "rdc", index: true },
+    icon: { type: String, default: "Landmark", trim: true },
+    title: { type: String, required: [true, "Title is required"], trim: true, maxlength: 120 },
+    text: { type: String, required: [true, "Text is required"], trim: true, maxlength: 600 },
+    tags: {
+      type: [{ type: String, trim: true, maxlength: 30 }],
+      default: [],
+      validate: [(v: string[]) => v.length <= 6, "Maximum 6 tags"],
+    },
+    order: { type: Number, default: 0, index: true },
+    isPublished: { type: Boolean, default: true },
+    createdBy: { type: String },
+  },
+  { timestamps: true }
+);
+
+featureSchema.index({ section: 1, order: 1 });
+
+export default model<IFeature>("Feature", featureSchema);
+
+import { Schema, model } from "mongoose";
+
+export interface IGlance {
+  // interface IGlance
+  category?: string; // badge + filter tab, e.g. "Governance & Policy"
+  footnote?: string; // small line at the bottom of the card
+  highlight: boolean; // amber featured card
+  value: string; // text, so "2025", "6th", "10+3+4" all work
+  label: string;
+  text: string;
+  order: number;
+  isPublished: boolean;
+  createdBy?: string; // Clerk user id
+}
+
+const glanceSchema = new Schema<IGlance>(
+  {
+    value: {
+      type: String,
+      required: [true, "Value is required"],
+      trim: true,
+      maxlength: 20,
+    },
+    label: {
+      type: String,
+      required: [true, "Label is required"],
+      trim: true,
+      maxlength: 80,
+    },
+    text: {
+      type: String,
+      required: [true, "Text is required"],
+      trim: true,
+      maxlength: 300,
+    },
+    order: { type: Number, default: 0, index: true },
+    isPublished: { type: Boolean, default: true },
+    category: { type: String, trim: true, maxlength: 40 },
+    footnote: { type: String, trim: true, maxlength: 80 },
+    highlight: { type: Boolean, default: false },
+    createdBy: { type: String },
+  },
+  { timestamps: true },
+);
+
+export default model<IGlance>("Glance", glanceSchema);
+
+
+import { Schema, model } from "mongoose";
+
+export const LINKAGE_STATUSES = ["Completed", "Initiated", "Linked", "Planned"] as const;
+export type LinkageStatus = (typeof LINKAGE_STATUSES)[number];
+
+export interface ILinkage {
+  title: string;          // partner name, e.g. "RFRI"
+  status: LinkageStatus;
+  text: string;           // one-line description of the collaboration
+  order: number;
+  isPublished: boolean;
+  createdBy?: string;     // Clerk user id
+}
+
+const linkageSchema = new Schema<ILinkage>(
+  {
+    title: { type: String, required: [true, "Title is required"], trim: true, maxlength: 80 },
+    status: { type: String, enum: LINKAGE_STATUSES, required: [true, "Status is required"], index: true },
+    text: { type: String, required: [true, "Text is required"], trim: true, maxlength: 400 },
+    order: { type: Number, default: 0, index: true },
+    isPublished: { type: Boolean, default: true },
+    createdBy: { type: String },
+  },
+  { timestamps: true }
+);
+
+export default model<ILinkage>("Linkage", linkageSchema);
+
+import { Router } from "express";
+import { requireAdmin, optionalAdmin } from "../middleware/auth";
+import { writeRateLimit } from "../middleware/rateLimitMiddleware"; // <- the file that exports writeRateLimit
+import { eventUpload } from "../middleware/upload";
+import {
+  createEvent, getEvents, getAdminEvents, getEventStats, getEvent,
+  updateEvent, deleteEvent, deleteEventMedia,
+} from "../controllers/eventController";
+
+const router = Router();
+
+router.get("/", getEvents);
+
+router.get("/admin/all", requireAdmin, getAdminEvents);
+router.get("/admin/stats", requireAdmin, getEventStats);
+// order matters: auth -> rate limit -> upload, so a throttled admin never makes the server parse files
+router.post("/", requireAdmin, writeRateLimit, eventUpload, createEvent);
+router.patch("/:id", requireAdmin, writeRateLimit, eventUpload, updateEvent);
+router.delete("/:id", requireAdmin, writeRateLimit, deleteEvent);
+router.delete("/:id/media/:mediaId", requireAdmin, writeRateLimit, deleteEventMedia);
+
+router.get("/:idOrSlug", optionalAdmin, getEvent);
+
+export default router;
+
+import { Router } from "express";
+import { requireAdmin } from "../middleware/auth";
+import { writeRateLimit } from "../middleware/rateLimitMiddleware"; // <- the file that exports writeRateLimit
+import {
+  getFeatures, getAdminFeatures, getFeature,
+  createFeature, updateFeature, reorderFeatures, deleteFeature,
+} from "../controllers/featureController";
+
+const router = Router();
+
+// public
+router.get("/", getFeatures);
+
+// admin (fixed paths must stay above "/:id")
+router.get("/admin/all", requireAdmin, getAdminFeatures);
+router.patch("/reorder", requireAdmin, writeRateLimit, reorderFeatures);
+router.post("/", requireAdmin, writeRateLimit, createFeature);
+
+router.get("/:id", getFeature);
+router.patch("/:id", requireAdmin, writeRateLimit, updateFeature);
+router.delete("/:id", requireAdmin, writeRateLimit, deleteFeature);
+
+export default router;
+
+import { Router } from "express";
+import { requireAdmin } from "../middleware/auth";
+import { writeRateLimit } from "../middleware/rateLimitMiddleware"; // <- the file that exports writeRateLimit
+import {
+  getGlance, getAdminGlance, createGlance, updateGlance, reorderGlance, deleteGlance,
+} from "../controllers/glanceController";
+
+const router = Router();
+
+router.get("/", getGlance);
+
+// fixed paths must stay above "/:id"
+router.get("/admin/all", requireAdmin, getAdminGlance);
+router.patch("/reorder", requireAdmin, writeRateLimit, reorderGlance);
+router.post("/", requireAdmin, writeRateLimit, createGlance);
+
+router.patch("/:id", requireAdmin, writeRateLimit, updateGlance);
+router.delete("/:id", requireAdmin, writeRateLimit, deleteGlance);
+
+export default router;
+
+import { Router } from "express";
+import { requireAdmin } from "../middleware/auth";
+import { writeRateLimit } from "../middleware/rateLimitMiddleware"; // <- the file that exports writeRateLimit
+import {
+  getLinkages, getAdminLinkages, getLinkage,
+  createLinkage, updateLinkage, reorderLinkages, deleteLinkage,
+} from "../controllers/linkageController";
+
+const router = Router();
+
+router.get("/", getLinkages);
+
+// fixed paths must stay above "/:id"
+router.get("/admin/all", requireAdmin, getAdminLinkages);
+router.patch("/reorder", requireAdmin, writeRateLimit, reorderLinkages);
+router.post("/", requireAdmin, writeRateLimit, createLinkage);
+
+router.get("/:id", getLinkage);
+router.patch("/:id", requireAdmin, writeRateLimit, updateLinkage);
+router.delete("/:id", requireAdmin, writeRateLimit, deleteLinkage);
+
+export default router;
+
+
+
+import "dotenv/config"; // must stay the very first line, so env vars exist before anything else loads
+
+import express from "express";
+import cors from "cors";
+import helmet from "helmet";
+import { clerkMiddleware } from "@clerk/express";
+
+import { connectDB } from "./src/utils/features";
+import { rateLimitMiddleware } from "./src/middleware/rateLimitMiddleware";
+import eventRoutes from "./src/routes/eventRoutes";
+import featureRoutes from "./src/routes/featureRoutes";
+import glanceRoutes from "./src/routes/glanceRoutes";
+import linkageRoutes from "./src/routes/linkageRoutes";
+import { errorHandler, notFound } from "./src/middleware/errorHandler";
+
+const port = process.env.PORT || 3000;
+const isProd = process.env.NODE_ENV === "production";
+
+connectDB(process.env.MONGO_URI || "");
+
+const app = express();
+
+// Render: Cloudflare -> Render proxy -> app (3 hops), so req.ip is the real visitor
+app.set("trust proxy", 3);
+
+// security headers; "cross-origin" lets your frontend load responses from this API
+app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
+
+// CORS: localhost only outside production
+const allowedOrigins = [
+  "https://iic-sibsagar-frontend.vercel.app",
+  process.env.FRONTEND_URL,
+  ...(isProd ? [] : ["http://localhost:3000", "http://localhost:3001"]),
+].filter((o): o is string => Boolean(o));
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+      return callback(new Error("Not allowed by CORS"));
+    },
+    credentials: true,
+  }),
+);
+
+// health check: before the rate limiter, so uptime pings never count against the limit
+app.get("/health", (_req, res) => {
+  res.json({ ok: true });
+});
+
+// Redis rate limit for every /api request: after CORS (a 429 still carries CORS headers), before body parsing and auth
+app.use("/api", rateLimitMiddleware);
+
+app.use(express.json({ limit: "100kb" })); // JSON bodies are small; file uploads go through multer, not here
+app.use(clerkMiddleware());
+
+app.get("/", (_req, res) => {
+  res.send("IIC & RDC API");
+});
+// app.get("/debug-ip", (req, res) => {
+//   res.json({
+//     ip: req.ip,
+//     ips: req.ips,
+//     xff: req.headers["x-forwarded-for"],
+//     trueClient: req.headers["true-client-ip"],
+//     cf: req.headers["cf-connecting-ip"],
+//   });
+// });
+app.use("/api/events", eventRoutes);
+app.use("/api/features", featureRoutes);
+app.use("/api/glance", glanceRoutes);
+app.use("/api/linkages", linkageRoutes);
+
+app.use(notFound); // after all routes
+app.use(errorHandler); // last
+
+app.listen(port, () => {
+  console.log("server working on", port);
+});
+
+import { Response } from "express";
+import { redis, PREFIX } from "./redis.js";
+
+/**
+ * Two layers, both optional:
+ *   L1  a small in-memory map inside this server instance
+ *   L2  Upstash Redis, shared by every instance
+ *
+ * Invalidation uses a version number per namespace ("events", "features"...).
+ * The version is part of every cache key, so one INCR makes all old keys
+ * unreachable at once (no SCAN, no key lists). They simply expire on their own.
+ *
+ * Everything fails open: if Redis is missing or erroring, requests just go to
+ * the database, nothing breaks.
+ */
+
+const VERSION_TTL_MS = 3_000; // how long an instance trusts its copy of a version
+const L1_TTL_MS = 60_000;
+const L1_MAX = 500;
+
+const versions = new Map<string, { v: number; exp: number }>();
+const l1 = new Map<string, { value: unknown; exp: number }>();
+const inflight = new Map<string, Promise<unknown>>();
+
+async function version(ns: string): Promise<string | null> {
+  if (!redis) return null;
+  const hit = versions.get(ns);
+  if (hit && hit.exp > Date.now()) return String(hit.v);
+  try {
+    const v = Number(await redis.get<number>(`${PREFIX}:ver:${ns}`)) || 0;
+    versions.set(ns, { v, exp: Date.now() + VERSION_TTL_MS });
+    return String(v);
+  } catch (err) {
+    console.error("[cache] version read failed:", err);
+    return null; // caller skips the cache
+  }
+}
+
+const fullKey = (ns: string, v: string, key: string) => `${PREFIX}:c:${ns}:${v}:${key}`;
+
+function remember(k: string, value: unknown) {
+  if (l1.size >= L1_MAX) l1.delete(l1.keys().next().value as string); // drop the oldest
+  l1.set(k, { value, exp: Date.now() + L1_TTL_MS });
+}
+
+export async function cacheGet<T>(ns: string, key: string): Promise<T | null> {
+  const v = await version(ns);
+  if (v === null) return null;
+  const k = fullKey(ns, v, key);
+
+  const mem = l1.get(k);
+  if (mem && mem.exp > Date.now()) return mem.value as T;
+
+  try {
+    const value = await redis!.get<T>(k);
+    if (value !== null && value !== undefined) {
+      remember(k, value);
+      return value;
+    }
+  } catch (err) {
+    console.error("[cache] read failed:", err);
+  }
+  return null;
+}
+
+export async function cacheSet(ns: string, key: string, value: unknown, ttlSec: number) {
+  const v = await version(ns);
+  if (v === null) return;
+  const k = fullKey(ns, v, key);
+  const plain = JSON.parse(JSON.stringify(value)); // mongoose documents -> plain JSON
+  remember(k, plain);
+  try {
+    await redis!.set(k, plain, { ex: ttlSec });
+  } catch (err) {
+    console.error("[cache] write failed:", err);
+  }
+}
+
+/** Get from cache, or run `loader` and store its result. Concurrent misses share one loader run. */
+export async function cached<T>(ns: string, key: string, ttlSec: number, loader: () => Promise<T>): Promise<T> {
+  const hit = await cacheGet<T>(ns, key);
+  if (hit !== null) return hit;
+
+  const id = `${ns}:${key}`;
+  const pending = inflight.get(id) as Promise<T> | undefined;
+  if (pending) return pending;
+
+  const run = (async () => {
+    const value = await loader();
+    await cacheSet(ns, key, value, ttlSec);
+    return value;
+  })().finally(() => inflight.delete(id));
+  inflight.set(id, run);
+  return run;
+}
+
+/** Call after any write. Bumps the version so every cached entry in the namespace is dropped. */
+export async function invalidate(...namespaces: string[]) {
+  l1.clear();
+  if (!redis) return;
+  await Promise.all(
+    namespaces.map(async (ns) => {
+      versions.delete(ns);
+      try {
+        await redis!.incr(`${PREFIX}:ver:${ns}`);
+      } catch (err) {
+        console.error("[cache] invalidate failed (entries expire on their own):", err);
+      }
+    }),
+  );
+}
+
+/** Lets a CDN / proxy in front of the API keep public responses for a short while. */
+export const publicCache = (res: Response, sec = 30) =>
+  res.set("Cache-Control", `public, max-age=0, s-maxage=${sec}, stale-while-revalidate=${sec * 5}`);
+
+export const noStore = (res: Response) => res.set("Cache-Control", "no-store");
+
+import "dotenv/config";
+import { v2 as cloudinary, UploadApiResponse } from "cloudinary";
+import { Readable } from "stream";
+import { IMedia, ResourceType } from "../models/Event";
+
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+  secure: true,
+});
+
+export const uploadBuffer = (
+  file: Express.Multer.File,
+  folder: string,
+  resourceType: ResourceType
+) =>
+  new Promise<UploadApiResponse>((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      {
+        folder,
+        resource_type: resourceType,
+        use_filename: true,
+        unique_filename: true,
+        filename_override: file.originalname,
+      },
+      (err, result) => (err || !result ? reject(err) : resolve(result))
+    );
+    Readable.from(file.buffer).pipe(stream);
+  });
+
+export const destroyAsset = (publicId: string, resourceType: ResourceType) =>
+  cloudinary.uploader.destroy(publicId, { resource_type: resourceType, invalidate: true });
+
+const toMedia = (r: UploadApiResponse, f: Express.Multer.File, type: ResourceType): IMedia => ({
+  url: r.secure_url,
+  publicId: r.public_id,
+  resourceType: type,
+  format: r.format,
+  bytes: r.bytes,
+  originalName: f.originalname,
+  width: r.width,
+  height: r.height,
+  duration: (r as any).duration,
+});
+
+export type UploadedFiles = { images: IMedia[]; videos: IMedia[]; documents: IMedia[] };
+
+// Uploads every file on the request and returns the media records
+export async function uploadEventFiles(
+  files: { [field: string]: Express.Multer.File[] } | undefined,
+  folder: string
+): Promise<UploadedFiles> {
+  const out: UploadedFiles = { images: [], videos: [], documents: [] };
+  if (!files) return out;
+
+  const plan: [keyof UploadedFiles, ResourceType][] = [
+    ["images", "image"],
+    ["videos", "video"],
+    ["documents", "raw"],
+  ];
+  try {
+    for (const [field, type] of plan) {
+      const list = files[field] ?? [];
+      const results = await Promise.all(list.map((f) => uploadBuffer(f, folder, type)));
+      results.forEach((r, i) => out[field].push(toMedia(r, list[i], type)));
+    }
+    return out;
+  } catch (err) {
+    await deleteMedia([...out.images, ...out.videos, ...out.documents]); // roll back partial uploads
+    throw err;
+  }
+}
+
+export const deleteMedia = async (items: IMedia[]) => {
+  await Promise.allSettled(items.map((m) => destroyAsset(m.publicId, m.resourceType)));
+};
+
+import mongoose from "mongoose";
+
+export const connectDB=(uri:string)=>{
+        mongoose.connect(uri,{
+            dbName:"IICSibsagar",
+        }).then(c=>console.log(`database connected ${c.connection.host}`)).catch(e=>console.log(e));
+       
+};
+
+import { Request, Response, NextFunction, RequestHandler } from "express";
+
+export const asyncHandler =
+  (fn: (req: Request, res: Response, next: NextFunction) => Promise<any>): RequestHandler =>
+  (req, res, next) => { fn(req, res, next).catch(next); };
+
+export class ApiError extends Error {
+  constructor(public status: number, message: string) { super(message); }
+}
+
+export const slugify = (text: string) =>
+  text.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "").slice(0, 80) +
+  "-" + Math.random().toString(36).slice(2, 7);
+
+// accepts ["a","b"], '["a","b"]' or "a"
+export const toArray = (v: unknown): string[] => {
+  if (!v) return [];
+  if (Array.isArray(v)) return v.map(String);
+  if (typeof v === "string") {
+    try { const p = JSON.parse(v); return Array.isArray(p) ? p.map(String) : [v]; } catch { return [v]; }
+  }
+  return [];
+};
+
+
+import { Ratelimit } from "@upstash/ratelimit";
+import { redis, PREFIX } from "./redis.js";
+
+type Result = { success: boolean; limit: number; remaining: number; reset: number };
+export type Limiter = { limit: (key: string) => Promise<Result> };
+
+// per-instance fallback, used only when Redis isn't configured
+function memoryLimiter(max: number, windowMs: number): Limiter {
+  const hits = new Map<string, { count: number; reset: number }>();
+  setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of hits) if (v.reset < now) hits.delete(k);
+  }, 60_000).unref();
+
+  return {
+    async limit(key) {
+      const now = Date.now();
+      let h = hits.get(key);
+      if (!h || h.reset < now) {
+        h = { count: 0, reset: now + windowMs };
+        hits.set(key, h);
+      }
+      h.count++;
+      return { success: h.count <= max, limit: max, remaining: Math.max(0, max - h.count), reset: h.reset };
+    },
+  };
+}
+
+function make(name: string, max: number, windowSec: number): Limiter {
+  if (!redis) return memoryLimiter(max, windowSec * 1000);
+  return new Ratelimit({
+    redis,
+    limiter: Ratelimit.slidingWindow(max, `${windowSec} s`),
+    prefix: `${PREFIX}:rl:${name}`,
+    ephemeralCache: new Map(), // remembers blocked IPs in memory, so a flood doesn't cost Redis commands
+    analytics: false,          // analytics writes extra commands
+  });
+}
+
+export const apiLimiter = make("api", 100, 60);   // every /api request, per IP
+export const writeLimiter = make("write", 30, 60); // admin writes, per admin user
+
+
+import "dotenv/config";
+import { Redis } from "@upstash/redis";
+
+const url = process.env.UPSTASH_REDIS_REST_URL;
+const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+
+export const redis = url && token ? new Redis({ url, token }) : null;
+export const PREFIX = "IIC_RDC-Protal"; // same prefix you already use
+
+if (!redis) console.warn("[redis] UPSTASH_* variables missing: rate limit uses memory, caching is OFF");
+
+{
+    "scripts": {
+        "dev": "tsx watch app.ts",
+        "build": "tsc",
+        "start": "node dist/app.js"
+    },
+    "dependencies": {
+        "@clerk/express": "^2.1.77",
+        "@upstash/ratelimit": "^2.2.0",
+        "@upstash/redis": "^1.39.0",
+        "cloudinary": "^2.11.0",
+        "cors": "^2.8.6",
+        "dotenv": "^18.0.6",
+        "express": "^5.2.1",
+        "helmet": "^8.3.0",
+        "mongoose": "^9.11.1",
+        "multer": "^2.4.0",
+        "zod": "^4.6.5"
+    },
+    "devDependencies": {
+        "@types/cors": "^2.8.19",
+        "@types/express": "^5.0.6",
+        "@types/multer": "^2.3.0",
+        "@types/node": "^26.6.4",
+        "tsx": "^4.23.15",
+        "typescript": "^7.0.2"
+    }
+}
+
+
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "outDir": "./dist",
+    "rootDir": ".",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true
+  },
+  "include": [
+    "app.ts",
+    "src/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist"
+  ]
+}
