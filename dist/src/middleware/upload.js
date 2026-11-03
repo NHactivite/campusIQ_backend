@@ -3,13 +3,15 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.eventUpload = void 0;
+exports.programmeUpload = exports.facilityUpload = exports.noticeUpload = exports.eventUpload = void 0;
 const multer_1 = __importDefault(require("multer"));
 const helpers_1 = require("../utils/helpers");
 const allowed = {
     images: /^image\/(jpeg|png|webp|gif)$/,
     videos: /^video\/(mp4|webm|quicktime)$/,
     documents: /^application\/(pdf|msword|vnd\.openxmlformats-officedocument\.(wordprocessingml\.document|spreadsheetml\.sheet|presentationml\.presentation)|vnd\.ms-excel|vnd\.ms-powerpoint)$/,
+    files: /^(image\/(jpeg|png|webp)|application\/pdf)$/, // notices: PDF or photo
+    syllabus: /^(application\/pdf|image\/(jpeg|png|webp))$/, // programmes: PDF or photo
 };
 const upload = (0, multer_1.default)({
     storage: multer_1.default.memoryStorage(),
@@ -28,3 +30,9 @@ exports.eventUpload = upload.fields([
     { name: "videos", maxCount: 3 },
     { name: "documents", maxCount: 10 },
 ]);
+exports.noticeUpload = upload.fields([{ name: "files", maxCount: 10 }]);
+exports.facilityUpload = upload.fields([
+    { name: "images", maxCount: 10 },
+    { name: "documents", maxCount: 10 },
+]);
+exports.programmeUpload = upload.fields([{ name: "syllabus", maxCount: 5 }]);

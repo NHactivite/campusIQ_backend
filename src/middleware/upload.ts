@@ -7,6 +7,7 @@ const allowed: Record<string, RegExp> = {
   documents:
     /^application\/(pdf|msword|vnd\.openxmlformats-officedocument\.(wordprocessingml\.document|spreadsheetml\.sheet|presentationml\.presentation)|vnd\.ms-excel|vnd\.ms-powerpoint)$/,
   files: /^(image\/(jpeg|png|webp)|application\/pdf)$/, // notices: PDF or photo
+  syllabus: /^(application\/pdf|image\/(jpeg|png|webp))$/, // programmes: PDF or photo
 };
 
 const upload = multer({
@@ -27,3 +28,10 @@ export const eventUpload = upload.fields([
 ]);
 
 export const noticeUpload = upload.fields([{ name: "files", maxCount: 10 }]);
+
+export const facilityUpload = upload.fields([
+  { name: "images", maxCount: 10 },
+  { name: "documents", maxCount: 10 },
+]);
+
+export const programmeUpload = upload.fields([{ name: "syllabus", maxCount: 5 }]);

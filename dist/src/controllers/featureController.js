@@ -38,6 +38,7 @@ const mongoose_1 = require("mongoose");
 const Feature_1 = __importStar(require("../models/Feature"));
 const helpers_1 = require("../utils/helpers");
 const cache_1 = require("../utils/cache");
+const chatbotSync_1 = require("../utils/chatbotSync");
 const pickFields = (b) => {
     const out = {};
     for (const k of ["title", "text", "icon", "section"])
@@ -99,6 +100,7 @@ exports.createFeature = (0, helpers_1.asyncHandler)(async (req, res) => {
     }
     const item = await Feature_1.default.create({ ...fields, section, createdBy: req.user?.id });
     await (0, cache_1.invalidate)("features");
+    void (0, chatbotSync_1.syncFeature)(item);
     res.status(201).json({ success: true, data: item });
 });
 // PATCH /api/features/:id   (admin, JSON)
@@ -112,6 +114,7 @@ exports.updateFeature = (0, helpers_1.asyncHandler)(async (req, res) => {
     if (!item)
         throw new helpers_1.ApiError(404, "Feature not found");
     await (0, cache_1.invalidate)("features");
+    void (0, chatbotSync_1.syncFeature)(item);
     res.json({ success: true, data: item });
 });
 // PATCH /api/features/reorder   (admin)  body: { items: [{ id, order }, ...] }
@@ -133,5 +136,6 @@ exports.deleteFeature = (0, helpers_1.asyncHandler)(async (req, res) => {
     if (!item)
         throw new helpers_1.ApiError(404, "Feature not found");
     await (0, cache_1.invalidate)("features");
+    void (0, chatbotSync_1.removeRecord)("feature", String(item._id));
     res.json({ success: true, message: "Feature deleted" });
 });

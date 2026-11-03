@@ -38,6 +38,7 @@ const mongoose_1 = require("mongoose");
 const Linkage_1 = __importStar(require("../models/Linkage"));
 const helpers_1 = require("../utils/helpers");
 const cache_1 = require("../utils/cache");
+const chatbotSync_1 = require("../utils/chatbotSync");
 const pickFields = (b) => {
     const out = {};
     for (const k of ["title", "status", "text"])
@@ -96,6 +97,7 @@ exports.createLinkage = (0, helpers_1.asyncHandler)(async (req, res) => {
         fields.order = await Linkage_1.default.countDocuments();
     const item = await Linkage_1.default.create({ ...fields, status, createdBy: req.user?.id });
     await (0, cache_1.invalidate)("linkages");
+    void (0, chatbotSync_1.syncLinkage)(item);
     res.status(201).json({ success: true, data: item });
 });
 // PATCH /api/linkages/:id   (admin, JSON)
@@ -109,6 +111,7 @@ exports.updateLinkage = (0, helpers_1.asyncHandler)(async (req, res) => {
     if (!item)
         throw new helpers_1.ApiError(404, "Linkage not found");
     await (0, cache_1.invalidate)("linkages");
+    void (0, chatbotSync_1.syncLinkage)(item);
     res.json({ success: true, data: item });
 });
 // PATCH /api/linkages/reorder   (admin)  body: { items: [{ id, order }] }
@@ -130,5 +133,6 @@ exports.deleteLinkage = (0, helpers_1.asyncHandler)(async (req, res) => {
     if (!item)
         throw new helpers_1.ApiError(404, "Linkage not found");
     await (0, cache_1.invalidate)("linkages");
+    void (0, chatbotSync_1.removeRecord)("linkage", String(item._id));
     res.json({ success: true, message: "Linkage deleted" });
 });

@@ -39,6 +39,7 @@ const Event_1 = __importStar(require("../models/Event"));
 const cloudinary_1 = require("../utils/cloudinary");
 const helpers_1 = require("../utils/helpers");
 const cache_1 = require("../utils/cache");
+const chatbotSync_1 = require("../utils/chatbotSync");
 const folderFor = (slug) => `iic/events/${slug}`;
 const allMedia = (e) => [...e.images, ...e.videos, ...e.documents];
 const pickFields = (b) => {
@@ -74,6 +75,7 @@ exports.createEvent = (0, helpers_1.asyncHandler)(async (req, res) => {
         throw err;
     }
     await (0, cache_1.invalidate)("events");
+    void (0, chatbotSync_1.syncEvent)(event);
     res.status(201).json({ success: true, data: event });
 });
 // GET /api/events  (public: published only)
@@ -196,6 +198,7 @@ exports.updateEvent = (0, helpers_1.asyncHandler)(async (req, res) => {
     }
     await (0, cloudinary_1.deleteMedia)(removed); // only after the DB save succeeded
     await (0, cache_1.invalidate)("events");
+    void (0, chatbotSync_1.syncEvent)(event);
     res.json({ success: true, data: event });
 });
 // DELETE /api/events/:id  (admin)
@@ -205,6 +208,7 @@ exports.deleteEvent = (0, helpers_1.asyncHandler)(async (req, res) => {
         throw new helpers_1.ApiError(404, "Event not found");
     await (0, cloudinary_1.deleteMedia)(allMedia(event));
     await (0, cache_1.invalidate)("events");
+    void (0, chatbotSync_1.removeEvent)(String(event._id));
     res.json({ success: true, message: "Event deleted" });
 });
 // DELETE /api/events/:id/media/:mediaId  (admin)
@@ -227,5 +231,6 @@ exports.deleteEventMedia = (0, helpers_1.asyncHandler)(async (req, res) => {
     await event.save();
     await (0, cloudinary_1.deleteMedia)([removed]);
     await (0, cache_1.invalidate)("events");
+    void (0, chatbotSync_1.syncEvent)(event);
     res.json({ success: true, data: event });
 });

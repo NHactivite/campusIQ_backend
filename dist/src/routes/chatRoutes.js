@@ -1,0 +1,11 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+const express_1 = require("express");
+const auth_1 = require("../middleware/auth");
+const chatController_1 = require("../controllers/chatController");
+const router = (0, express_1.Router)();
+router.get("/admin/stats", auth_1.requireAdmin, chatController_1.getChatStats);
+router.get("/admin/threads", auth_1.requireAdmin, chatController_1.getThreads);
+router.get("/admin/threads/:userId/:threadId", auth_1.requireAdmin, chatController_1.getThreadMessages);
+router.get("/admin/unanswered", auth_1.requireAdmin, chatController_1.getUnanswered);
+exports.default = router;

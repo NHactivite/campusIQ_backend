@@ -8,6 +8,7 @@ const mongoose_1 = require("mongoose");
 const Glance_1 = __importDefault(require("../models/Glance"));
 const helpers_1 = require("../utils/helpers");
 const cache_1 = require("../utils/cache");
+const chatbotSync_1 = require("../utils/chatbotSync");
 const pickFields = (b) => {
     const out = {};
     for (const k of ["value", "label", "text", "category", "footnote"])
@@ -49,6 +50,7 @@ exports.createGlance = (0, helpers_1.asyncHandler)(async (req, res) => {
         fields.order = await Glance_1.default.countDocuments();
     const item = await Glance_1.default.create({ ...fields, createdBy: req.user?.id });
     await (0, cache_1.invalidate)("glance");
+    void (0, chatbotSync_1.syncGlance)(item);
     res.status(201).json({ success: true, data: item });
 });
 // PATCH /api/glance/:id   (admin, JSON)
@@ -59,6 +61,7 @@ exports.updateGlance = (0, helpers_1.asyncHandler)(async (req, res) => {
     if (!item)
         throw new helpers_1.ApiError(404, "Card not found");
     await (0, cache_1.invalidate)("glance");
+    void (0, chatbotSync_1.syncGlance)(item);
     res.json({ success: true, data: item });
 });
 // PATCH /api/glance/reorder   (admin)  body: { items: [{ id, order }] }
@@ -80,5 +83,6 @@ exports.deleteGlance = (0, helpers_1.asyncHandler)(async (req, res) => {
     if (!item)
         throw new helpers_1.ApiError(404, "Card not found");
     await (0, cache_1.invalidate)("glance");
+    void (0, chatbotSync_1.removeRecord)("glance", String(item._id));
     res.json({ success: true, message: "Card deleted" });
 });

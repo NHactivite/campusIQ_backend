@@ -4,11 +4,13 @@ import Notice from "../models/Notice";
 import Feature from "../models/Feature";
 import Glance from "../models/Glance";
 import Linkage from "../models/Linkage";
+import Facility from "../models/Facility";
+import Programme from "../models/Programme";
 import { asyncHandler, ApiError } from "../utils/helpers";
 import { noStore } from "../utils/cache";
-import { getIndex, syncEvent, syncNotice, syncFeature, syncGlance, syncLinkage } from "../utils/chatbotSync";
+import { getIndex, syncEvent, syncNotice, syncFeature, syncGlance, syncLinkage, syncFacility, syncProgramme } from "../utils/chatbotSync";
 
-type Kind = "event" | "notice" | "feature" | "glance" | "linkage";
+type Kind = "event" | "notice" | "feature" | "glance" | "linkage" | "facility" | "programme";
 type PartStatus = "ok" | "missing" | "skipped" | "no_text";
 type Part = { label: string; status: PartStatus; note?: string };
 type Row = {
@@ -28,6 +30,8 @@ const syncers: Record<Kind, { model: any; sync: (d: any) => Promise<void> }> = {
   feature: { model: Feature, sync: syncFeature },
   glance: { model: Glance, sync: syncGlance },
   linkage: { model: Linkage, sync: syncLinkage },
+  facility: { model: Facility, sync: syncFacility },
+  programme: { model: Programme, sync: syncProgramme },
 };
 
 const isPdf = (m: any) => /\.pdf$/i.test(m.originalName ?? m.url ?? "");
@@ -85,7 +89,7 @@ async function buildRows(): Promise<Row[]> {
     rows.push(finish({ kind: "notice", id, title: n.title, category: n.category, updatedAt: String((n as any).updatedAt ?? ""), published: n.isPublished !== false, parts }));
   }
 
-  const simple = (kind: "feature" | "glance" | "linkage", list: any[], title: (d: any) => string) => {
+  const simple = (kind: "feature" | "glance" | "linkage" | "facility" | "programme", list: any[], title: (d: any) => string) => {
     for (const d of list) {
       const id = String(d._id);
       rows.push(finish({
@@ -97,6 +101,8 @@ async function buildRows(): Promise<Row[]> {
   simple("feature", await Feature.find().lean(), (d) => d.title);
   simple("glance", await Glance.find().lean(), (d) => d.label);
   simple("linkage", await Linkage.find().lean(), (d) => d.title);
+  simple("facility", await Facility.find().lean(), (d) => d.name);
+  simple("programme", await Programme.find().lean(), (d) => d.name);
 
   const order = { missing: 0, partial: 1, indexed: 2, draft: 3 };
   return rows.sort((a, b) => order[a.status] - order[b.status] || a.title.localeCompare(b.title));

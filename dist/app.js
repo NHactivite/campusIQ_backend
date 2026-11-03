@@ -8,19 +8,24 @@ const express_1 = __importDefault(require("express"));
 const cors_1 = __importDefault(require("cors"));
 const helmet_1 = __importDefault(require("helmet"));
 const express_2 = require("@clerk/express");
+const noticeRoutes_1 = __importDefault(require("./src/routes/noticeRoutes"));
 const features_1 = require("./src/utils/features");
 const rateLimitMiddleware_1 = require("./src/middleware/rateLimitMiddleware");
 const eventRoutes_1 = __importDefault(require("./src/routes/eventRoutes"));
+const indexRouetes_1 = __importDefault(require("./src/routes/indexRouetes"));
 const featureRoutes_1 = __importDefault(require("./src/routes/featureRoutes"));
 const glanceRoutes_1 = __importDefault(require("./src/routes/glanceRoutes"));
 const linkageRoutes_1 = __importDefault(require("./src/routes/linkageRoutes"));
 const errorHandler_1 = require("./src/middleware/errorHandler");
+const chatRoutes_1 = __importDefault(require("./src/routes/chatRoutes"));
+const facilityRoutes_1 = __importDefault(require("./src/routes/facilityRoutes"));
+const programmeRoutes_1 = __importDefault(require("./src/routes/programmeRoutes"));
 const port = process.env.PORT || 3000;
 const isProd = process.env.NODE_ENV === "production";
 (0, features_1.connectDB)(process.env.MONGO_URI || "");
 const app = (0, express_1.default)();
-// Render sits behind a proxy: needed so req.ip is the real visitor, which the rate limiter relies on
-app.set("trust proxy", 1);
+// Render: Cloudflare -> Render proxy -> app (3 hops), so req.ip is the real visitor
+app.set("trust proxy", 3);
 // security headers; "cross-origin" lets your frontend load responses from this API
 app.use((0, helmet_1.default)({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
 // CORS: localhost only outside production
@@ -48,10 +53,24 @@ app.use((0, express_2.clerkMiddleware)());
 app.get("/", (_req, res) => {
     res.send("IIC & RDC API");
 });
+// app.get("/debug-ip", (req, res) => {
+//   res.json({
+//     ip: req.ip,
+//     ips: req.ips,
+//     xff: req.headers["x-forwarded-for"],
+//     trueClient: req.headers["true-client-ip"],
+//     cf: req.headers["cf-connecting-ip"],
+//   });
+// });
 app.use("/api/events", eventRoutes_1.default);
 app.use("/api/features", featureRoutes_1.default);
 app.use("/api/glance", glanceRoutes_1.default);
 app.use("/api/linkages", linkageRoutes_1.default);
+app.use("/api/notices", noticeRoutes_1.default);
+app.use("/api/index", indexRouetes_1.default);
+app.use("/api/chats", chatRoutes_1.default);
+app.use("/api/facilities", facilityRoutes_1.default);
+app.use("/api/programmes", programmeRoutes_1.default);
 app.use(errorHandler_1.notFound); // after all routes
 app.use(errorHandler_1.errorHandler); // last
 app.listen(port, () => {

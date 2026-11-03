@@ -2,6 +2,7 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.deleteMedia = exports.destroyAsset = exports.uploadBuffer = void 0;
 exports.uploadEventFiles = uploadEventFiles;
+exports.uploadFlatFiles = uploadFlatFiles;
 require("dotenv/config");
 const cloudinary_1 = require("cloudinary");
 const stream_1 = require("stream");
@@ -35,7 +36,11 @@ const toMedia = (r, f, type) => ({
     height: r.height,
     duration: r.duration,
 });
-// Uploads every file on the request and returns the media records
+const deleteMedia = async (items) => {
+    await Promise.allSettled(items.map((m) => (0, exports.destroyAsset)(m.publicId, m.resourceType)));
+};
+exports.deleteMedia = deleteMedia;
+// Events: uploads every file on the request and returns the media records
 async function uploadEventFiles(files, folder) {
     const out = { images: [], videos: [], documents: [] };
     if (!files)
@@ -58,7 +63,21 @@ async function uploadEventFiles(files, folder) {
         throw err;
     }
 }
-const deleteMedia = async (items) => {
-    await Promise.allSettled(items.map((m) => (0, exports.destroyAsset)(m.publicId, m.resourceType)));
-};
-exports.deleteMedia = deleteMedia;
+// Notices: uploads a flat list. Photos go up as "image", everything else (PDF) as "raw"
+async function uploadFlatFiles(files, folder) {
+    if (!files?.length)
+        return [];
+    const done = [];
+    try {
+        return await Promise.all(files.map(async (f) => {
+            const type = f.mimetype.startsWith("image/") ? "image" : "raw";
+            const m = toMedia(await (0, exports.uploadBuffer)(f, folder, type), f, type);
+            done.push(m);
+            return m;
+        }));
+    }
+    catch (err) {
+        await (0, exports.deleteMedia)(done); // roll back partial uploads
+        throw err;
+    }
+}

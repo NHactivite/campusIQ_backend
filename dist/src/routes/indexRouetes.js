@@ -1,0 +1,11 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+const express_1 = require("express");
+const auth_1 = require("../middleware/auth");
+const rateLimitMiddleware_1 = require("../middleware/rateLimitMiddleware");
+const indexController_1 = require("../controllers/indexController");
+const router = (0, express_1.Router)();
+router.get("/status", auth_1.requireAdmin, indexController_1.getIndexStatus);
+router.post("/resync-missing", auth_1.requireAdmin, rateLimitMiddleware_1.writeRateLimit, indexController_1.resyncMissing);
+router.post("/resync/:kind/:id", auth_1.requireAdmin, rateLimitMiddleware_1.writeRateLimit, indexController_1.resyncOne);
+exports.default = router;

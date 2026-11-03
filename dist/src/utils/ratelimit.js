@@ -36,5 +36,5 @@ function make(name, max, windowSec) {
         analytics: false, // analytics writes extra commands
     });
 }
-exports.apiLimiter = make("api", 300, 10); // every /api request, per IP
+exports.apiLimiter = make("api", 100, 60); // every /api request, per IP
 exports.writeLimiter = make("write", 30, 60); // admin writes, per admin user

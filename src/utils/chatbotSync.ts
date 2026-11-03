@@ -69,12 +69,56 @@ export const syncLinkage = (l: any) => {
 export const removeRecord = (kind: "feature" | "glance" | "linkage", id: string) =>
   call(`/internal/documents/${kind}:${id}`, "DELETE");
 
+/* ---------- campus facilities ---------- */
+export const syncFacility = (f: any) => {
+  const d = plain(f);
+  return call("/internal/documents/sync", "POST", {
+    _id: `facility:${d._id}`,
+    title: `Campus Facility: ${d.name}`,
+    category: d.category ?? "other",
+    text: [
+      `Campus Facility: ${d.name}`,
+      d.description,
+      d.location ? `Location: ${d.location}` : "",
+      d.operatingHours ? `Operating Hours: ${d.operatingHours}` : "",
+      d.contactDetails ? `Contact: ${d.contactDetails}` : "",
+      d.amenities?.length ? `Services/Amenities: ${d.amenities.join(", ")}` : "",
+    ].filter(Boolean).join("\n"),
+    files: d.documents ?? [],
+    isPublished: d.isPublished !== false,
+  });
+};
+export const removeFacility = (id: string) => call(`/internal/documents/facility:${id}`, "DELETE");
+
+/* ---------- academic programmes ---------- */
+export const syncProgramme = (p: any) => {
+  const d = plain(p);
+  return call("/internal/documents/sync", "POST", {
+    _id: `programme:${d._id}`,
+    title: `Academic Programme: ${d.name}`,
+    category: d.degreeLevel ?? "other",
+    text: [
+      `Academic Programme: ${d.name}`,
+      `Degree Level: ${d.degreeLevel}`,
+      `Department: ${d.department}`,
+      `Duration: ${d.duration}`,
+      d.eligibilityCriteria ? `Eligibility: ${d.eligibilityCriteria}` : "",
+      d.admissionRequirements ? `Admission Requirements: ${d.admissionRequirements}` : "",
+      d.courseOverview ? `Course Overview: ${d.courseOverview}` : "",
+      d.availableSeats !== undefined ? `Available Seats: ${d.availableSeats}` : "",
+    ].filter(Boolean).join("\n"),
+    files: d.syllabus ?? [],
+    isPublished: d.isPublished !== false,
+  });
+};
+export const removeProgramme = (id: string) => call(`/internal/documents/programme:${id}`, "DELETE");
+
 // what the chatbot has indexed right now (used by the admin Index Status page)
 export async function getIndex(): Promise<{ ids: string[]; cache: Record<string, number> }> {
   if (!BASE || !SECRET) throw new Error("Chatbot sync is not configured (CHATBOT_URL / INGEST_SECRET)");
   const res = await fetch(`${BASE}/internal/index`, {
     headers: { "x-ingest-secret": SECRET },
-    signal: AbortSignal.timeout(30_000),
+    signal: AbortSignal.timeout(60_000),
   });
   if (!res.ok) throw new Error(`Chatbot returned ${res.status}`);
   return res.json() as Promise<{ ids: string[]; cache: Record<string, number> }>;
