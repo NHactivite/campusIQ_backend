@@ -2,14 +2,11 @@ import { Schema, model, HydratedDocument } from "mongoose";
 import { IMedia } from "./Event";
 
 export const FACILITY_CATEGORIES = [
-  "library",
-  "sports",
+  "research",
+  "innovation",
+  "incubation",
   "laboratory",
-  "canteen",
-  "hostel",
-  "medical",
-  "transport",
-  "it",
+  "IT",
   "auditorium",
   "other",
 ] as const;

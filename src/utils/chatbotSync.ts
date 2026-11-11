@@ -114,12 +114,12 @@ export const syncProgramme = (p: any) => {
 export const removeProgramme = (id: string) => call(`/internal/documents/programme:${id}`, "DELETE");
 
 // what the chatbot has indexed right now (used by the admin Index Status page)
-export async function getIndex(): Promise<{ ids: string[]; cache: Record<string, number> }> {
+export async function getIndex(): Promise<{ ids: string[]; cache: Record<string, number>; empty: string[] }> {
   if (!BASE || !SECRET) throw new Error("Chatbot sync is not configured (CHATBOT_URL / INGEST_SECRET)");
   const res = await fetch(`${BASE}/internal/index`, {
     headers: { "x-ingest-secret": SECRET },
     signal: AbortSignal.timeout(60_000),
   });
   if (!res.ok) throw new Error(`Chatbot returned ${res.status}`);
-  return res.json() as Promise<{ ids: string[]; cache: Record<string, number> }>;
+ return res.json() as Promise<{ ids: string[]; cache: Record<string, number>; empty: string[] }>;
 }

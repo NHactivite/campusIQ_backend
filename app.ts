@@ -15,7 +15,6 @@ import linkageRoutes from "./src/routes/linkageRoutes";
 import { errorHandler, notFound } from "./src/middleware/errorHandler";
 import chatRoutes from "./src/routes/chatRoutes";
 import facilityRoutes from "./src/routes/facilityRoutes";
-import programmeRoutes from "./src/routes/programmeRoutes";
 
 const port = process.env.PORT || 3000;
 const isProd = process.env.NODE_ENV === "production";
@@ -32,7 +31,6 @@ app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
 
 // CORS: localhost only outside production
 const allowedOrigins = [
-  "https://iic-sibsagar-frontend.vercel.app",
   process.env.FRONTEND_URL,
   ...(isProd ? [] : ["http://localhost:3000", "http://localhost:3001"]),
 ].filter((o): o is string => Boolean(o));
@@ -78,7 +76,6 @@ app.use("/api/notices", noticeRoutes)
 app.use("/api/index", indexRoutes);
 app.use("/api/chats", chatRoutes);
 app.use("/api/facilities", facilityRoutes);
-app.use("/api/programmes", programmeRoutes);
 app.use(notFound); // after all routes
 app.use(errorHandler); // last
 
