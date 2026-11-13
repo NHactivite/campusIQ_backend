@@ -123,3 +123,16 @@ export async function getIndex(): Promise<{ ids: string[]; cache: Record<string,
   if (!res.ok) throw new Error(`Chatbot returned ${res.status}`);
  return res.json() as Promise<{ ids: string[]; cache: Record<string, number>; empty: string[] }>;
 }
+
+
+export async function generateEventReport(event: unknown): Promise<Buffer> {
+  if (!BASE || !SECRET) throw new Error("Chatbot sync is not configured (CHATBOT_URL / INGEST_SECRET)");
+  const res = await fetch(`${BASE}/internal/events/report`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-ingest-secret": SECRET },
+    body: JSON.stringify(plain(event)),
+    signal: AbortSignal.timeout(120_000), // Gemini, plus a possible cold start
+  });
+  if (!res.ok) throw new Error(`Chatbot returned ${res.status}`);
+  return Buffer.from(await res.arrayBuffer());
+}

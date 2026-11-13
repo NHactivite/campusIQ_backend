@@ -5,6 +5,7 @@ import { eventUpload } from "../middleware/upload";
 import {
   createEvent, getEvents, getAdminEvents, getEventStats, getEvent,
   updateEvent, deleteEvent, deleteEventMedia,
+  getEventReport,
 } from "../controllers/eventController";
 
 const router = Router();
@@ -18,6 +19,7 @@ router.post("/", requireAdmin, writeRateLimit, eventUpload, createEvent);
 router.patch("/:id", requireAdmin, writeRateLimit, eventUpload, updateEvent);
 router.delete("/:id", requireAdmin, writeRateLimit, deleteEvent);
 router.delete("/:id/media/:mediaId", requireAdmin, writeRateLimit, deleteEventMedia);
+router.get("/:id/report", requireAdmin, writeRateLimit, getEventReport);
 
 router.get("/:idOrSlug", optionalAdmin, getEvent);
 

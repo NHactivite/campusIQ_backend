@@ -4,7 +4,7 @@ import Event, { IMedia, EVENT_CATEGORIES } from "../models/Event";
 import { uploadEventFiles, deleteMedia } from "../utils/cloudinary";
 import { asyncHandler, ApiError, slugify, toArray } from "../utils/helpers";
 import { cached, cacheGet, cacheSet, invalidate, publicCache, noStore } from "../utils/cache";
-import { removeEvent, syncEvent } from "../utils/chatbotSync";
+import { removeEvent, syncEvent, generateEventReport } from "../utils/chatbotSync";
 
 type Files = { [field: string]: Express.Multer.File[] } | undefined;
 const folderFor = (slug: string) => `iic/events/${slug}`;
@@ -200,4 +200,24 @@ export const deleteEventMedia = asyncHandler(async (req, res) => {
   await invalidate("events");
   void syncEvent(event); 
   res.json({ success: true, data: event });
+});
+
+
+
+// GET /api/events/:id/report  (admin) – PDF report written by the chatbot
+export const getEventReport = asyncHandler(async (req, res) => {
+  const event = await Event.findById(req.params.id);
+  if (!event) throw new ApiError(404, "Event not found");
+  let pdf: Buffer;
+  try {
+    pdf = await generateEventReport(event);
+  } catch (err: any) {
+    throw new ApiError(502, `Could not generate the report: ${err.message}`);
+  }
+  noStore(res);
+  res.set({
+    "Content-Type": "application/pdf",
+    "Content-Disposition": `attachment; filename="${event.slug}-report.pdf"`,
+  });
+  res.send(pdf);
 });
